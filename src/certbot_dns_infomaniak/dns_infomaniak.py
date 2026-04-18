@@ -2,11 +2,12 @@
 # SPDX-FileCopyrightText: 2021-2022 Yannik Roth <info@fuechslein.ch>
 # SPDX-FileCopyrightText: 2021      Romain Autran <romain.autran@2itea.ch>
 # SPDX-License-Identifier: Apache-2.0
-"""DNS Authenticator for Infomaniak"""
+"""DNS Authenticator for Infomaniak."""
 import json
 import logging
-import idna
+import time
 
+import idna
 import requests
 
 from certbot import errors
@@ -20,22 +21,25 @@ logger = logging.getLogger(__name__)
 
 
 class Authenticator(dns_common.DNSAuthenticator):
-    """DNS Authenticator for Infomaniak
+    """DNS Authenticator for Infomaniak.
 
-    This plugin enables usage of Infomaniak public API to complete``dns-01`` challenges."""
+    Completes ``dns-01`` challenges using the Infomaniak public API.
+    Propagation is confirmed by polling the API's own ``/check`` endpoint
+    instead of sleeping for a fixed duration.
+    """
 
     description = "Automates dns-01 challenges using Infomaniak API"
 
     def __init__(self, *args, **kwargs):
-        # super(Authenticator, self).__init__(*args, **kwargs)
         super().__init__(*args, **kwargs)
         self.token = ""
         self.credentials = None
+        self._record_ids = {}
 
     @classmethod
     def add_parser_arguments(cls, add):  # pylint: disable=arguments-differ
         super(Authenticator, cls).add_parser_arguments(
-            add, default_propagation_seconds=120
+            add, default_propagation_seconds=10
         )
         add("credentials", help="Infomaniak credentials INI file.")
 
@@ -61,14 +65,24 @@ class Authenticator(dns_common.DNSAuthenticator):
     def _perform(self, domain, validation_name, validation):
         decoded_domain = idna.decode(domain)
         try:
-            self._api_client().add_txt_record(decoded_domain, validation_name, validation)
+            record_id = self._api_client().add_txt_record(
+                decoded_domain, validation_name, validation,
+            )
         except ValueError as err:
             raise errors.PluginError("Cannot add txt record: {err}".format(err=err))
+        if record_id is not None:
+            self._record_ids[(validation_name, validation)] = (decoded_domain, record_id)
 
     def _cleanup(self, domain, validation_name, validation):
-        decoded_domain = idna.decode(domain)
+        cached = self._record_ids.pop((validation_name, validation), None)
+        if cached is None:
+            logger.warning(
+                "No tracked record id for %s; skipping cleanup", validation_name,
+            )
+            return
+        cached_domain, record_id = cached
         try:
-            self._api_client().del_txt_record(decoded_domain, validation_name, validation)
+            self._api_client().del_txt_record_by_id(cached_domain, record_id)
         except ValueError as err:
             raise errors.PluginError("Cannot del txt record: {err}".format(err=err))
 
@@ -80,170 +94,152 @@ class _APIDomain:
 
     baseUrl = "https://api.infomaniak.com"
 
-    def __init__(self, token):
-        """Initialize class managing a domain within Infomaniak API
+    # Polling parameters for the /check endpoint (post-create propagation).
+    check_interval = 3
+    check_timeout = 120
 
-        :param str token: oauth2 token to consume Infomaniak API
+    def __init__(self, token):
+        """Initialize the API client.
+
+        :param str token: OAuth2 token to consume the Infomaniak API.
         """
         self.token = token
         self.session = requests.Session()
-        self.session.headers.update({"Authorization": "Bearer {token}".format(token=self.token)})
+        self.session.headers.update(
+            {"Authorization": "Bearer {token}".format(token=self.token)}
+        )
+
+    def _handle_response(self, req):
+        try:
+            result = req.json()
+        except json.decoder.JSONDecodeError as exc:
+            raise errors.PluginError("no JSON in API response") from exc
+        if result.get("result") == "success":
+            return result.get("data")
+        error = result.get("error") or {}
+        if error.get("code") == "not_authorized":
+            raise errors.PluginError("cannot authenticate")
+        raise errors.PluginError(
+            "error in API request: {} / {}".format(
+                error.get("code"), error.get("description")
+            )
+        )
 
     def _get_request(self, url, payload=None):
-        """Performs a GET request against API
-
-        :param str url: relative url
-        :param dict payload : body of request
-        """
         url = self.baseUrl + url
         logger.debug("GET %s", url)
         with self.session.get(url, params=payload) as req:
-            try:
-                result = req.json()
-            except json.decoder.JSONDecodeError as exc:
-                raise errors.PluginError("no JSON in API response") from exc
-            if result["result"] == "success":
-                return result["data"]
-            if result["error"]["code"] == "not_authorized":
-                raise errors.PluginError("cannot authenticate")
-            raise errors.PluginError(
-                "error in API request: {} / {}".format(
-                    result["error"]["code"], result["error"]["description"]
-                )
-            )
+            return self._handle_response(req)
 
     def _post_request(self, url, payload):
-        """Performs a POST request
-
-        :param str url: relative url
-        :param dict payload : body of request
-        """
         url = self.baseUrl + url
         headers = {"Content-Type": "application/json"}
         json_data = json.dumps(payload)
         logger.debug("POST %s", url)
         with self.session.post(url, data=json_data, headers=headers) as req:
-            try:
-                result = req.json()
-            except json.decoder.JSONDecodeError as exc:
-                raise errors.PluginError("no JSON in API response") from exc
-            if result["result"] == "success":
-                return result["data"]
-            raise errors.PluginError(
-                "error in API request: {} / {}".format(
-                    result["error"]["code"], result["error"]["description"]
-                )
-            )
+            return self._handle_response(req)
 
     def _delete_request(self, url):
-        """Performs a POST request
-
-        :param str url: relative url
-        """
         url = self.baseUrl + url
         logger.debug("DELETE %s", url)
         with self.session.delete(url) as req:
-            try:
-                result = req.json()
-            except json.decoder.JSONDecodeError as exc:
-                raise errors.PluginError("no JSON in API response") from exc
-            if result["result"] == "success":
-                return result["data"]
-            raise errors.PluginError(
-                "error in API request: {} / {}".format(
-                    result["error"]["code"], result["error"]["description"]
-                )
-            )
+            return self._handle_response(req)
 
-    def _get_records(self, domain, domain_id, record):
-        """Find record matching arguments
-
-        :param str domain: domain name
-        :param int domain_id: domain id
-        :param dict record: dict describing records- keys are type, source and target
-
-        :returns: records list
-        :rtype: list
-        """
-        for needed in ["type", "source", "target"]:
-            if needed not in record:
-                raise ValueError("{} not provided in record dict".format(needed))
-
-        if record["source"] == ".":
-            fqdn = domain
-        else:
-            fqdn = "{source}.{domain}".format(source=record["source"], domain=domain)
-        return list(
-            filter(
-                lambda x: (
-                    x["source_idn"] == fqdn
-                    and x["type"] == record["type"]
-                    and x["target"] == record["target"]
-                ),
-                self._get_request("/1/domain/{domain_id}/dns/record?search={fqdn}&filter[types][]={type}".format(domain_id=domain_id, fqdn=fqdn, type=record["type"])),
-            )
-        )
+    @staticmethod
+    def _encode_zone(zone):
+        """Return the ASCII / punycode form of a zone name for use in URLs."""
+        return idna.encode(zone).decode("ascii")
 
     def _find_zone(self, domain):
-        """Finds the corresponding DNS zone through the API
+        """Find the DNS zone corresponding to ``domain``.
 
-        :param str domain: domain name
-
-        :returns: id and zone name
+        Iterates from the full domain up to the registrable domain, probing
+        ``GET /2/zones/{zone}`` until one succeeds.
         """
-        while "." in domain:
-            result = self._get_request(
-                "/1/product?service_name=domain&customer_name={domain}".format(domain=domain),
-            )
-            if len(result) == 1:
-                return (
-                    result[0]["id"],
-                    domain,
+        candidate = domain
+        while "." in candidate:
+            try:
+                self._get_request(
+                    "/2/zones/{zone}".format(zone=self._encode_zone(candidate)),
                 )
-            domain = domain[domain.find(".") + 1:]
+                return candidate
+            except errors.PluginError as exc:
+                if "cannot authenticate" in str(exc):
+                    raise
+                candidate = candidate[candidate.find(".") + 1:]
         raise errors.PluginError("Domain not found")
 
-    def add_txt_record(self, domain, source, target, ttl=300):
-        """Add a TXT DNS record to a domain
+    @staticmethod
+    def _relative_source(source, zone):
+        """Strip the trailing zone from ``source`` if present."""
+        zone_ascii = idna.encode(zone).decode("ascii")
+        suffix = "." + zone_ascii
+        if source == zone_ascii:
+            return "."
+        if source.endswith(suffix):
+            return source[: -len(suffix)]
+        return source
 
-        :param str domain: domain name to lookup
-        :param str source: record key in zone (left prefix before domain)
-        :param str target: value of record
-        :param int ttl: optional ttl of record to create
-        """
-        logger.debug("add_txt_record %s %s %s", domain, source, target)
-        (domain_id, domain_name) = self._find_zone(domain)
-        logger.debug("%s / %s", domain_id, domain_name)
-        if source.endswith("." + idna.encode(domain_name).decode("ascii")):
-            relative_source = source[:source.rfind("." + idna.encode(domain_name).decode("ascii"))]
-        else:
-            relative_source = source
-        logger.debug("add_txt_record %s %s %s", domain_name, relative_source, target)
-        data = {"type": "TXT", "source": relative_source, "target": target, "ttl": ttl}
-        self._post_request("/1/domain/{domain_id}/dns/record".format(domain_id=domain_id), data)
-
-    def del_txt_record(self, domain, source, target):
-        """Delete a TXT DNS record from a domain
-
-        :param str source: record key in zone (left prefix before domain)
-        :param str target: value of record
-        """
-        logger.debug("del_txt_record %s %s %s", domain, source, target)
-        (domain_id, domain_name) = self._find_zone(domain)
-        if source.endswith("." + idna.encode(domain_name).decode("ascii")):
-            relative_source = source[:source.rfind("." + idna.encode(domain_name).decode("ascii"))]
-        else:
-            relative_source = source
-        logger.debug("del_txt_record %s %s %s", domain_name, relative_source, target)
-        records = self._get_records(
-            domain_name, domain_id,
-            {"type": "TXT", "source": relative_source, "target": target},
+    def _wait_for_propagation(self, zone, record_id):
+        """Poll the ``/check`` endpoint until the record is live or timeout."""
+        if record_id is None:
+            return
+        deadline = time.monotonic() + self.check_timeout
+        url = "/2/zones/{zone}/records/{record_id}/check".format(
+            zone=self._encode_zone(zone), record_id=record_id,
         )
-        if records is None:
-            raise errors.PluginError("Record not found")
-        if len(records) > 1:
-            raise errors.PluginError("Several records match")
-        record_id = records[0]["id"]
+        while True:
+            try:
+                if self._get_request(url) is True:
+                    logger.debug("Record %s is propagated", record_id)
+                    return
+            except errors.PluginError as exc:
+                logger.debug("check endpoint returned error: %s", exc)
+            if time.monotonic() >= deadline:
+                logger.warning(
+                    "Timed out waiting for record %s to propagate; "
+                    "falling back to propagation_seconds",
+                    record_id,
+                )
+                return
+            time.sleep(self.check_interval)
 
-        self._delete_request("/1/domain/{domain_id}/dns/record/{record_id}".format(
-            domain_id=domain_id, record_id=record_id))
+    @staticmethod
+    def _extract_record_id(data):
+        """Extract the record ID from a POST response payload."""
+        if isinstance(data, dict):
+            return data.get("id")
+        if isinstance(data, (int, str)):
+            try:
+                return int(data)
+            except (TypeError, ValueError):
+                return None
+        return None
+
+    def add_txt_record(self, domain, source, target, ttl=300):
+        """Add a TXT DNS record to a domain.
+
+        :returns: the created record id, or ``None`` if the API response
+            did not include one.
+        """
+        zone = self._find_zone(domain)
+        relative_source = self._relative_source(source, zone)
+        logger.debug("add_txt_record %s %s %s", zone, relative_source, target)
+        payload = {
+            "type": "TXT", "source": relative_source, "target": target, "ttl": ttl,
+        }
+        response = self._post_request(
+            "/2/zones/{zone}/records".format(zone=self._encode_zone(zone)), payload,
+        )
+        record_id = self._extract_record_id(response)
+        self._wait_for_propagation(zone, record_id)
+        return record_id
+
+    def del_txt_record_by_id(self, domain, record_id):
+        """Delete a DNS record by id, resolving the zone from ``domain``."""
+        zone = self._find_zone(domain)
+        self._delete_request(
+            "/2/zones/{zone}/records/{record_id}".format(
+                zone=self._encode_zone(zone), record_id=record_id,
+            )
+        )

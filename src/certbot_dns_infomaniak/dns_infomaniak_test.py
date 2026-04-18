@@ -2,14 +2,13 @@
 # SPDX-License-Identifier: Apache-2.0
 """Tests for certbot_dns_infomaniak.dns_infomaniak."""
 
-import unittest
-
-import logging
-from unittest import mock
-import requests_mock
-
-import sys
 import io
+import logging
+import sys
+import unittest
+from unittest import mock
+
+import requests_mock
 
 from certbot.errors import PluginError
 try:
@@ -26,7 +25,8 @@ logger = logging.getLogger(__name__)
 logger.setLevel(logging.DEBUG)
 
 
-FAKE_TOKEN = "xxxx"
+FAKE_TOKEN = "xxxx"  # noqa: S105
+FAKE_RECORD_ID = 1001234
 
 
 class AuthenticatorTest(
@@ -44,6 +44,7 @@ class AuthenticatorTest(
         self.auth = Authenticator(self.config, "infomaniak")
 
         self.mock_client = mock.MagicMock(default_propagation_seconds=15)
+        self.mock_client.add_txt_record.return_value = FAKE_RECORD_ID
 
         self.auth._api_client = mock.MagicMock(return_value=self.mock_client)
 
@@ -61,7 +62,7 @@ class AuthenticatorTest(
         sys.stdout = self.old_stdout
 
     def test_perform(self):
-        """Tests the perform function to see if client method is called"""
+        """perform() should delegate to add_txt_record on the client"""
         self.auth.perform([self.achall])
 
         expected = [
@@ -69,38 +70,45 @@ class AuthenticatorTest(
         ]
         self.assertEqual(expected, self.mock_client.mock_calls)
 
-    def test_cleanup(self):
-        """Tests mthe cleanup method to see if client method is called"""
+    def test_cleanup_uses_tracked_record_id(self):
+        """cleanup() should delete the record by the id tracked during perform()"""
+        # _attempt_cleanup | pylint: disable=protected-access
+        self.auth._attempt_cleanup = True
+        self.auth.perform([self.achall])
+        self.mock_client.reset_mock()
+        self.auth.cleanup([self.achall])
+
+        expected = [mock.call.del_txt_record_by_id(DOMAIN, FAKE_RECORD_ID)]
+        self.assertEqual(expected, self.mock_client.mock_calls)
+
+    def test_cleanup_without_tracked_id_is_noop(self):
+        """cleanup() without a tracked id should log a warning and skip"""
         # _attempt_cleanup | pylint: disable=protected-access
         self.auth._attempt_cleanup = True
         self.auth.cleanup([self.achall])
 
-        expected = [
-            mock.call.del_txt_record(DOMAIN, "_acme-challenge." + DOMAIN, mock.ANY)
-        ]
-        self.assertEqual(expected, self.mock_client.mock_calls)
+        self.assertEqual([], self.mock_client.mock_calls)
 
 
 class APIDomainTest(unittest.TestCase):
-    """Class to test the _APIDomain class"""
+    """Class to test the _APIDomain class against the Infomaniak API."""
     record_name = "foo"
     record_content = "bar"
     record_ttl = 42
+    record_id = FAKE_RECORD_ID
 
     def setUp(self):
         self.adapter = requests_mock.Adapter()
 
         self.client = _APIDomain(FAKE_TOKEN)
         self.client.baseUrl = "mock://endpoint"
+        # Speed up polling in tests.
+        self.client.check_interval = 0
+        self.client.check_timeout = 1
         self.client.session.mount("mock", self.adapter)
 
     def _register_response(self, url, data=None, method=requests_mock.ANY):
-        """Registers a reply in the requests mock
-
-        :param str url: url to register response
-        :param dict data: data to return
-        :param str method: method for which response is registered (default to all)
-        """
+        """Register a successful reply."""
         resp = {"result": "success", "data": data}
         self.adapter.register_uri(
             method,
@@ -108,129 +116,136 @@ class APIDomainTest(unittest.TestCase):
             json=resp,
         )
 
-    def _register_error(self, url, code, description):
-        """Registers an error reply in the requests mock
-
-        :param str url: url to register response
-        :param int code: error code
-        :param str description: error description
-        """
+    def _register_error(self, url, code, description, method=requests_mock.ANY):
+        """Register an error reply."""
         resp = {"result": "error", "error": {"code": code, "description": description}}
         self.adapter.register_uri(
-            requests_mock.ANY,
+            method,
             self.client.baseUrl + url,
             json=resp,
         )
 
     def test_add_txt_record(self):
-        """add_txt_record with normal params should succeed"""
+        """add_txt_record should POST the record and return the created id"""
         self._register_response(
-            "/1/product?service_name=domain&customer_name={domain}".format(domain=DOMAIN),
-            data=[
-                {
-                    "id": 654321,
-                    "account_id": 1234,
-                    "service_id": 14,
-                    "service_name": "domain",
-                    "customer_name": DOMAIN,
-                }
-            ],
+            "/2/zones/{domain}".format(domain=DOMAIN), data={"name": DOMAIN},
         )
-        self._register_response("/1/domain/654321/dns/record", "1001234", "POST")
-        self.client.add_txt_record(
-            DOMAIN, self.record_name, self.record_content, self.record_ttl
+        self._register_response(
+            "/2/zones/{domain}/records".format(domain=DOMAIN),
+            data=self.record_id,
+            method="POST",
+        )
+        self._register_response(
+            "/2/zones/{domain}/records/{rid}/check".format(
+                domain=DOMAIN, rid=self.record_id,
+            ),
+            data=True,
+            method="GET",
         )
 
-    def test_add_txt_record_fail_to_find_domain(self):
-        """add_txt_record with non existing domain should fail"""
+        record_id = self.client.add_txt_record(
+            DOMAIN, self.record_name, self.record_content, self.record_ttl,
+        )
+        self.assertEqual(self.record_id, record_id)
+
+    def test_add_txt_record_id_in_object(self):
+        """add_txt_record should also accept a POST response shaped as an object"""
         self._register_response(
-            "/1/product?service_name=domain&customer_name={domain}".format(domain=DOMAIN),
-            data=[],
+            "/2/zones/{domain}".format(domain=DOMAIN), data={"name": DOMAIN},
+        )
+        self._register_response(
+            "/2/zones/{domain}/records".format(domain=DOMAIN),
+            data={"id": self.record_id, "type": "TXT"},
+            method="POST",
+        )
+        self._register_response(
+            "/2/zones/{domain}/records/{rid}/check".format(
+                domain=DOMAIN, rid=self.record_id,
+            ),
+            data=True,
+            method="GET",
+        )
+
+        record_id = self.client.add_txt_record(
+            DOMAIN, self.record_name, self.record_content, self.record_ttl,
+        )
+        self.assertEqual(self.record_id, record_id)
+
+    def test_add_txt_record_polling_times_out(self):
+        """add_txt_record should return normally when /check never returns true"""
+        self._register_response(
+            "/2/zones/{domain}".format(domain=DOMAIN), data={"name": DOMAIN},
+        )
+        self._register_response(
+            "/2/zones/{domain}/records".format(domain=DOMAIN),
+            data=self.record_id,
+            method="POST",
+        )
+        self._register_response(
+            "/2/zones/{domain}/records/{rid}/check".format(
+                domain=DOMAIN, rid=self.record_id,
+            ),
+            data=False,
+            method="GET",
+        )
+        self.client.check_timeout = 0
+
+        record_id = self.client.add_txt_record(
+            DOMAIN, self.record_name, self.record_content, self.record_ttl,
+        )
+        self.assertEqual(self.record_id, record_id)
+
+    def test_add_txt_record_fail_to_find_zone(self):
+        """add_txt_record with a non-existing domain should fail"""
+        self.adapter.register_uri(
+            requests_mock.ANY,
+            requests_mock.ANY,
+            json={
+                "result": "error",
+                "error": {"code": "not_found", "description": "zone not found"},
+            },
         )
         with self.assertRaises(PluginError):
             self.client.add_txt_record(
-                DOMAIN, self.record_name, self.record_content, self.record_ttl
+                DOMAIN, self.record_name, self.record_content, self.record_ttl,
             )
 
     def test_add_txt_record_fail_to_authenticate(self):
-        """add_txt_record with wrong token should fail"""
+        """add_txt_record with an unauthorized token should fail"""
         self._register_error(
-            "/1/product?service_name=domain&customer_name={domain}".format(domain=DOMAIN),
+            "/2/zones/{domain}".format(domain=DOMAIN),
             "not_authorized",
             "Authorization required",
         )
         with self.assertRaises(PluginError):
             self.client.add_txt_record(
-                DOMAIN, self.record_name, self.record_content, self.record_ttl
+                DOMAIN, self.record_name, self.record_content, self.record_ttl,
             )
 
-    def test_del_txt_record(self):
-        """del_txt_record with normal params should succeed"""
+    def test_del_txt_record_by_id(self):
+        """del_txt_record_by_id should DELETE /2/zones/{zone}/records/{id}"""
         self._register_response(
-            "/1/product?service_name=domain&customer_name={domain}".format(domain=DOMAIN),
-            data=[
-                {
-                    "id": "654321",
-                    "account_id": "1234",
-                    "service_id": "14",
-                    "service_name": "domain",
-                    "customer_name": DOMAIN,
-                }
-            ],
+            "/2/zones/{domain}".format(domain=DOMAIN), data={"name": DOMAIN},
         )
         self._register_response(
-            "/1/domain/654321/dns/record",
-            [
-                {
-                    "id": "11110",
-                    "source": ".",
-                    "source_idn": DOMAIN,
-                    "type": "NS",
-                    "ttl": 3600,
-                    "target": "ns1.death.star",
-                },
-                {
-                    "id": "11111",
-                    "source": self.record_name,
-                    "source_idn": "{name}.{domain}".format(name=self.record_name, domain=DOMAIN),
-                    "type": "TXT",
-                    "ttl": self.record_ttl,
-                    "target": self.record_content,
-                },
-            ],
-        )
-        self._register_response(
-            "/1/domain/654321/dns/record/11111",
-            True,
-            "DELETE",
-        )
-        self.client.del_txt_record(
-            DOMAIN, "{name}.{domain}".format(name=self.record_name, domain=DOMAIN),
-            self.record_content,
+            "/2/zones/{domain}/records/{rid}".format(
+                domain=DOMAIN, rid=self.record_id,
+            ),
+            data=True,
+            method="DELETE",
         )
 
-    def test_del_txt_record_fail_to_find_domain(self):
-        """del_txt_record with non existing domain should fail"""
-        self._register_response(
-            "/1/product?service_name=domain&customer_name={domain}".format(domain=DOMAIN),
-            data=[],
-        )
-        with self.assertRaises(PluginError):
-            self.client.del_txt_record(
-                DOMAIN, self.record_name, self.record_content
-            )
+        self.client.del_txt_record_by_id(DOMAIN, self.record_id)
 
-    def test_del_txt_record_fail_to_authenticate(self):
-        """del_txt_recod with wrong token should fail"""
+    def test_del_txt_record_by_id_fail_to_authenticate(self):
+        """del_txt_record_by_id with an unauthorized token should fail"""
         self._register_error(
-            "/1/product?service_name=domain&customer_name={domain}".format(domain=DOMAIN),
+            "/2/zones/{domain}".format(domain=DOMAIN),
             "not_authorized",
             "Authorization required",
         )
         with self.assertRaises(PluginError):
-            self.client.del_txt_record(
-                DOMAIN, self.record_name, self.record_content
-            )
+            self.client.del_txt_record_by_id(DOMAIN, self.record_id)
 
 
 if __name__ == "__main__":

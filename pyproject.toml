@@ -4,7 +4,7 @@ build-backend = "uv_build"
 
 [project]
 name = "certbot-dns-infomaniak"
-version = "0.0.0"
+version = "1.0.0"
 description = "Infomaniak DNS Authenticator plugin for Certbot"
 readme = "README.rst"
 authors = [

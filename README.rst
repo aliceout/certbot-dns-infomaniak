@@ -3,7 +3,10 @@ certbot-dns-infomaniak
 
 Infomaniak_ DNS Authenticator plugin for certbot_
 
-This plugin enables usage of Infomaniak public API to complete ``dns-01`` challenges.
+This plugin uses the Infomaniak public API to complete ``dns-01`` challenges.
+After creating the challenge record, it polls the API's ``/check`` endpoint
+to confirm propagation on the authoritative name servers rather than sleeping
+for a fixed duration.
 
 .. _Infomaniak: https://www.infomaniak.com/
 .. _certbot: https://certbot.eff.org/
@@ -11,11 +14,14 @@ This plugin enables usage of Infomaniak public API to complete ``dns-01`` challe
 Issue a token
 -------------
 
-At your Infomaniak manager dashboard_, to to the API section and generate a token
-with "Domain" scope
+At your Infomaniak manager dashboard_, go to the API section and generate a
+token with the following scopes:
+
+- ``domain:read``
+- ``dns:read``
+- ``dns:write``
 
 .. _dashboard: https://manager.infomaniak.com/v3/infomaniak-api
-
 
 Installation
 ------------
@@ -103,6 +109,35 @@ token:
 .. code-block:: bash
 
    Environment="INFOMANIAK_API_TOKEN=<YOUR_API_TOKEN>"
+
+Migrating from 0.2.x
+--------------------
+
+Version ``1.0.0`` moves the plugin from Infomaniak API v1 to API v2. Users
+upgrading from ``0.2.x`` must:
+
+1. **Regenerate the API token.** v2 requires the scopes ``domain:read``,
+   ``dns:read`` and ``dns:write``. The legacy "Domain" scope issued for v1
+   will not work.
+2. **Review ``propagation_seconds``.** The default was lowered from ``120``
+   to ``10`` because the plugin now polls the API's ``/check`` endpoint to
+   confirm propagation. The configured ``propagation_seconds`` only acts as
+   a final safety buffer after ``/check`` confirms (or times out).
+
+No configuration file change is required beyond the token itself.
+
+Known issues
+------------
+
+Fast Anycast
+^^^^^^^^^^^^
+
+If the domain has Infomaniak's **Fast Anycast** option enabled, records
+created via the API are accepted and stored but are never published on the
+authoritative name servers. This makes the ``dns-01`` challenge fail because
+Let's Encrypt cannot resolve the TXT record. Disable Fast Anycast on the
+domain before using this plugin. See upstream issue `#47
+<https://github.com/Infomaniak/certbot-dns-infomaniak/issues/47>`_.
 
 Local Development
 -----------------
